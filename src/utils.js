@@ -1,8 +1,7 @@
 const Apify = require('apify');
-const Puppeteer = require('puppeteer'); // eslint-disable-line
-const { PlacePaginationData, Review } = require('./typedefs'); // eslint-disable-line
+const Puppeteer = require('puppeteer');
 
-const { DEFAULT_TIMEOUT } = require('./consts');
+const { DEFAULT_TIMEOUT, PLACE_TITLE_SEL, BACK_BUTTON_SEL } = require('./consts');
 
 const { log } = Apify.utils;
 
@@ -11,7 +10,7 @@ const { log } = Apify.utils;
  * @param {Puppeteer.Page} page
  * @return {Promise<void>}
  */
-const waitForGoogleMapLoader = async (page) => {
+module.exports.waitForGoogleMapLoader = async (page) => {
     if (await page.$('#searchbox')) {
         // @ts-ignore
         await page.waitForFunction(() => !document.querySelector('#searchbox')
@@ -21,163 +20,8 @@ const waitForGoogleMapLoader = async (page) => {
     await page.waitForFunction(() => !document.querySelector('.loading-pane-section-loading'), { timeout: DEFAULT_TIMEOUT });
 };
 
-/** @param {string} googleResponseString */
-const stringifyGoogleXrhResponse = (googleResponseString) => {
-    return JSON.parse(googleResponseString.replace(')]}\'', ''));
-};
-
 /** @param {number} float */
-const fixFloatNumber = (float) => Number(float.toFixed(7));
-
-/**
- * @param {any} result
- * @param {boolean} isAdvertisement
-*/
-const parsePaginationResult = (result, isAdvertisement) => {
-    // index 14 has detailed data about each place
-    const detailInfoIndex = isAdvertisement ? 15 : 14;
-    const place = result[detailInfoIndex];
-    if (!place) {
-        return;
-    }
-    // Some places don't have any address
-    const addressDetail = place[183] ? place[183][1] : undefined;
-    const addressParsed = addressDetail ?  {
-        neighborhood: addressDetail[1],
-        street: addressDetail[2],
-        city: addressDetail[3],
-        postalCode: addressDetail[4],
-        state: addressDetail[5],
-        countryCode: addressDetail[6],
-    } : undefined;
-    return {
-        placeId: place[78],
-        coords: { lat: fixFloatNumber(place[9][2]), lng: fixFloatNumber(place[9][3]) },
-        addressParsed,
-        isAdvertisement,
-    };
-}
-
-/**
- * Response from google xhr is kind a weird. Mix of array of array.
- * This function parse places from the response body.
- * @param {Buffer} responseBodyBuffer
- * @return {PlacePaginationData[]}
- */
-const parseSearchPlacesResponseBody = (responseBodyBuffer) => {
-    /** @type {PlacePaginationData[]} */
-    const placePaginationData = [];
-    const jsonString = responseBodyBuffer
-        .toString('utf-8')
-        .replace('/*""*/', '');
-    const jsonObject = JSON.parse(jsonString);
-    const data = stringifyGoogleXrhResponse(jsonObject.d);
-
-    // We are paring ads but seems Google is not showing them to the scraper right now
-    const ads = (data[2] && data[2][1] && data[2][1][0]) || [];
-
-    ads.forEach((/** @type {any} */ ad) => {
-        const placeData = parsePaginationResult(ad, true);
-        if (placeData) {
-            placePaginationData.push(placeData);
-        } else {
-            log.warning(`[SEARCH]: Cannot find place data for advertisement in search.`)
-        }
-    })
-
-    /** @type {any} Too complex to type out*/
-    let organicResults = data[0][1];
-    // If the search goes to search results, the first one is not a place
-    // If the search goes to a place directly, the first one is that place
-    if (organicResults.length > 1) {
-        organicResults = organicResults.slice(1)
-    }
-    organicResults.forEach((/** @type {any} */ result ) => {
-        const placeData = parsePaginationResult(result, false);
-        if (placeData) {
-            placePaginationData.push(placeData);
-        } else {
-            log.warning(`[SEARCH]: Cannot find place data in search.`)
-        }
-    });
-    return placePaginationData;
-};
-
-/**
- * Parses review from a single review array json Google format
- * @param {any} jsonArray
- * @param {string} reviewsTranslation
- * @return {Review}
- */
-const parseReviewFromJson = (jsonArray, reviewsTranslation) => {
-    let text = jsonArray[3];
-
-    // Optionally remove translation
-    // TODO: Perhaps the text is differentiated in the JSON
-    if (typeof text === 'string' && reviewsTranslation !== 'originalAndTranslated') {
-        const splitReviewText = text.split('\n\n(Original)\n');
-
-        if (reviewsTranslation === 'onlyOriginal') {
-            // Fallback if there is no translation
-            text = splitReviewText[1] || splitReviewText[0];
-        } else if (reviewsTranslation === 'onlyTranslated') {
-            text = splitReviewText[0];
-        }
-        text = text.replace('(Translated by Google)', '').replace('\n\n(Original)\n', '').trim();
-    }
-
-    return {
-        name: jsonArray[0][1],
-        text,
-        publishAt: jsonArray[1],
-        publishedAtDate: new Date(jsonArray[27]).toISOString(),
-        likesCount: jsonArray[15],
-        reviewId: jsonArray[10],
-        reviewUrl: jsonArray[18],
-        reviewerId: jsonArray[6],
-        reviewerUrl: jsonArray[0][0],
-        reviewerNumberOfReviews: jsonArray[12] && jsonArray[12][1] && jsonArray[12][1][1],
-        isLocalGuide: jsonArray[12] && jsonArray[12][1] && Array.isArray(jsonArray[12][1][0]),
-        // On some places google shows reviews from other services like booking
-        // There isn't stars but rating for this places reviews
-        stars: jsonArray[4] || null,
-        // Trip advisor
-        rating: jsonArray[25] ? jsonArray[25][1] : null,
-        responseFromOwnerDate: jsonArray[9] && jsonArray[9][3]
-            ? new Date(jsonArray[9][3]).toISOString()
-            : null,
-        responseFromOwnerText: jsonArray[9] ? jsonArray[9][1] : null,
-    };
-}
-
-/**
- * Response from google xhr is kind a weird. Mix of array of array.
- * This function parse reviews from the response body.
- * @param {Buffer | string} responseBody
- * @param {string} reviewsTranslation
- * @return [place]
- */
-const parseReviewFromResponseBody = (responseBody, reviewsTranslation) => {
-    /** @type {Review[]} */
-    const currentReviews = [];
-    const stringBody = typeof responseBody === 'string'
-        ? responseBody
-        : responseBody.toString('utf-8');
-    let results;
-    try {
-        results = stringifyGoogleXrhResponse(stringBody);
-    } catch (e) {
-        return { error: e.message };
-    } 
-    if (!results || !results[2]) {
-        return { currentReviews };
-    }
-    results[2].forEach((/** @type {any} */ jsonArray) => {
-        const review = parseReviewFromJson(jsonArray, reviewsTranslation);
-        currentReviews.push(review);
-    });
-    return { currentReviews };
-};
+module.exports.fixFloatNumber = (float) => Number(float.toFixed(7));
 
 /**
  * Method scrolls page to xpos, ypos.
@@ -185,7 +29,7 @@ const parseReviewFromResponseBody = (responseBody, reviewsTranslation) => {
  * @param {string} selectorToScroll
  * @param {number} scrollToHeight
  */
-const scrollTo = async (page, selectorToScroll, scrollToHeight) => {
+module.exports.scrollTo = async (page, selectorToScroll, scrollToHeight) => {
     try {
         await page.waitForSelector(selectorToScroll);
     } catch (e) {
@@ -198,29 +42,9 @@ const scrollTo = async (page, selectorToScroll, scrollToHeight) => {
 };
 
 /** @param {string} url */
-const parseZoomFromUrl = (url) => {
+module.exports.parseZoomFromUrl = (url) => {
     const zoomMatch = url.match(/@[0-9.-]+,[0-9.-]+,([0-9.]+)z/);
     return zoomMatch ? Number(zoomMatch[1]) : null;
-};
-
-/** @param {string[]} imageUrls */
-const enlargeImageUrls = (imageUrls) => {
-    // w1920-h1080
-    const FULL_RESOLUTION = {
-        width: 1920,
-        height: 1080,
-    };
-    return imageUrls.map((imageUrl) => {
-        const sizeMatch = imageUrl.match(/=s\d+/);
-        const widthHeightMatch = imageUrl.match(/=w\d+-h\d+/);
-        if (sizeMatch) {
-            return imageUrl.replace(sizeMatch[0], `=s${FULL_RESOLUTION.width}`);
-        }
-        if (widthHeightMatch) {
-            return imageUrl.replace(widthHeightMatch[0], `=w${FULL_RESOLUTION.width}-h${FULL_RESOLUTION.height}`);
-        }
-        return imageUrl;
-    });
 };
 
 /**
@@ -256,17 +80,76 @@ const waiter = async (predicate, options = {}) => {
         await new Promise((resolve) => setTimeout(resolve, pollInterval));
     }
 };
+module.exports.waiter = waiter;
+
+/**
+ * Navigates back to the details page
+ * either by clicking back button or reloading the main page
+ *
+ * @param {Puppeteer.Page} page
+ * @param {string} pageLabel label for the current page for error messages
+ * @param {string} placeUrl URL for hard reload
+ */
+module.exports.navigateBack = async (page, pageLabel, placeUrl) => {
+    const title = await page.$(PLACE_TITLE_SEL);
+    if (title) {
+        log.info('[PLACE]: We are still on the details page -> no back navigation needed');
+        return;
+    }
+    try {
+        const backButtonPresent = async () => {
+            const backButton = await page.$(BACK_BUTTON_SEL);
+            return backButton != null;
+        }
+        await waiter(backButtonPresent, {
+            timeout: 2000,
+            pollInterval: 500,
+            timeoutErrorMeesage: `Waiting for backButton on ${pageLabel} page ran into a timeout after 2s on URL: ${placeUrl}`,
+        });
+        const navigationSucceeded = async () => {
+            const backButton = await page.$(BACK_BUTTON_SEL);
+            if (backButton) {
+                await backButton.evaluate((backButtonNode) => {
+                    if (backButtonNode instanceof HTMLElement) {
+                        backButtonNode.click();
+                    }
+                });
+            }
+            const title = await page.$(PLACE_TITLE_SEL);
+            if (title) {
+                return true;
+            }
+        }
+        await waiter(navigationSucceeded, {
+            // timeout: 10000,
+            // pollInterval: 500,
+            timeoutErrorMeesage: `Waiting for back navigation on ${pageLabel} page ran into a timeout after 10s on URL: ${placeUrl}`,
+        });
+    } catch (e) {
+        // As a last resort, we just reload the main page
+        log.warning(`${e.message} - will hard reload the place page instead`);
+        try {
+            await page.goto(placeUrl);
+            await page.waitForSelector(PLACE_TITLE_SEL);
+            await Apify.utils.puppeteer.injectJQuery(page);
+        } catch (e) {
+            throw 'Reloading the page to navigate back failed, retrying whole request';
+        }
+    }
+}
 
 /**
  * @param {Puppeteer.Page} page
  * @param {string} url
+ * @param {boolean} persistCookiesPerSession
+ * @param {Apify.Session | undefined} session
  */
- const waitAndHandleConsentScreen = async (page, url) => {
+module.exports.waitAndHandleConsentScreen = async (page, url, persistCookiesPerSession, session) => {
     // TODO: Test if the new consent screen works well!
 
     const predicate = async (shouldClick = false) => {
-        // handling consent page (usually shows up on startup)
-        const consentButton = await page.$('[action*="https://consent.google.com/"] button');
+        // handling consent page (usually shows up on startup), handles non .com domains
+        const consentButton = await page.$('[action^="https://consent.google"] button');
         if (consentButton) {
             if (shouldClick) {
                 await Promise.all([
@@ -288,6 +171,28 @@ const waiter = async (predicate, options = {}) => {
         }
     };
 
+    /**
+     * Puts the CONSENT Cookie into the session
+     */
+    const updateCookies = async () => {
+        if (session) {
+            const cookies = await page.cookies(url);
+            // Without changing the domain, apify won't find the cookie later.
+            // Changing the domain can duplicate cookies in the saved session state, so only the necessary cookie is saved here.
+            if (cookies) {
+                let consentCookie = cookies.filter(cookie => cookie.name=="CONSENT")[0];
+                // overwrite the pending cookie to make sure, we don't set the pending cookie when Apify is fixed
+                session.setPuppeteerCookies([{... consentCookie}], "https://www.google.com/");
+                if (consentCookie) {
+                    consentCookie.domain = "www.google.com"
+                }
+                session.setPuppeteerCookies([consentCookie], "https://www.google.com/");
+            }
+        } else {
+            log.warning("Session is undefined -> consent screen cookies not saved")
+        }
+    }
+
     await waiter(predicate, {
         timeout: 60000,
         pollInterval: 500,
@@ -295,16 +200,47 @@ const waiter = async (predicate, options = {}) => {
         successMessage: `Approved consent screen on URL: ${url}`,
     });
     await predicate(true);
+    if (persistCookiesPerSession) {
+        await updateCookies();
+    }
 };
 
-module.exports = {
-    waitForGoogleMapLoader,
-    parseSearchPlacesResponseBody,
-    parseReviewFromResponseBody,
-    parseReviewFromJson,
-    scrollTo,
-    parseZoomFromUrl,
-    enlargeImageUrls,
-    waiter,
-    waitAndHandleConsentScreen,
+// 
+
+/**
+ * Only certain formats of place URLs will give the JSON with data
+ * Examples in /samples/URLS-PLACE.js
+ * https://www.google.com/maps/place/All+Bar+One+Waterloo/@51.5027459,-0.1196255,17z/data=!4m5!3m4!1s0x487604b8703e7371:0x4fa0bac2e4eea2de!8m2!3d51.5027724!4d-0.11729
+ * https://www.google.com/maps/place/All+Bar+One+Waterloo/@51.5031352,-0.1219012,17z/data=!3m1!5s0x487604c79a2ef535:0x6b1752373d1ab417!4m12!1m6!3m5!1s0x487604b900d26973:0x4291f3172409ea92!2slastminute.com+London+Eye!8m2!3d51.5032973!4d-0.1195537!3m4!1s0x487604b8703e7371:0x4fa0bac2e4eea2de!8m2!3d51.5027724!4d-0.11729
+ * @param {string} url 
+ * @returns {string}
+ */
+module.exports.normalizePlaceUrl = (url) => {
+    const match = url.match(/(.+\/data=)(.+)/);
+    if (!match) {
+        log.warning(`Cannot normalize place URL, didn't find data param --- ${url}`);
+        return url;
+    }
+    const [, basePart, dataPart] = match;
+    const hashPairs = dataPart.match(/\ds0x[0-9a-z]+:0x[0-9a-z]+/g);
+    if (!hashPairs || hashPairs.length === 0) {
+        log.warning(`Cannot normalize place URL, didn't find hash pairs --- ${url}`);
+        return url;
+    }
+    const lastHashPair = hashPairs[hashPairs.length - 1];
+    const lastHashPairSuffixRegex = new RegExp(`${lastHashPair}.+`);
+    const lastHashPairSuffixMatch = dataPart.match(lastHashPairSuffixRegex);
+    if (!lastHashPairSuffixMatch) {
+        log.warning(`Cannot normalize place URL, cannot find the suffix after hash pair --- ${url}`);
+        return url;
+    }
+    const firstDataPart = '!4m5!3m4!';
+    const normalized = `${basePart}${firstDataPart}${lastHashPairSuffixMatch}`;
+    log.debug(`Normalized Start URL: ${url} => ${normalized}`);
+    return normalized;
+}
+
+/** @param {string} googleResponseString */
+module.exports.stringifyGoogleXrhResponse = (googleResponseString) => {
+    return JSON.parse(googleResponseString.replace(')]}\'', ''));
 };

@@ -1,32 +1,37 @@
 const Apify = require('apify'); // eslint-disable-line no-unused-vars
-const Puppeteer = require('puppeteer'); // eslint-disable-line
+const Puppeteer = require('puppeteer'); // eslint-disable-line no-unused-vars
+const MaxCrawledPlacesTracker = require('./max-crawled-places'); // eslint-disable-line no-unused-vars
 
-const { ScrapingOptions, AddressParsed, PlaceUserData } = require('./typedefs'); // eslint-disable-line no-unused-vars
+const { ScrapingOptions, PlaceUserData } = require('./typedefs'); // eslint-disable-line no-unused-vars
 const ErrorSnapshotter = require('./error-snapshotter'); // eslint-disable-line no-unused-vars
 const Stats = require('./stats'); // eslint-disable-line no-unused-vars
 
 const { extractPageData, extractPopularTimes, extractOpeningHours, extractPeopleAlsoSearch,
-    extractAdditionalInfo, extractReviews, extractImages } = require('./extractors');
+    extractAdditionalInfo } = require('./extractors/general');
+const { extractImages } = require('./extractors/images');
+const { extractReviews } = require('./extractors/reviews');
 const { DEFAULT_TIMEOUT, PLACE_TITLE_SEL } = require('./consts');
-const { checkInPolygon } = require('./polygon');
 const { waitForGoogleMapLoader } = require('./utils');
 
 const { log } = Apify.utils;
 
 /**
  * @param {{
-*  page: Puppeteer.Page,
-*  request: Apify.Request,
-*  searchString: string,
-*  session: Apify.Session,
-*  scrapingOptions: ScrapingOptions,
-*  errorSnapshotter: ErrorSnapshotter,
-*  stats: Stats,
-* }} options
-*/
+ *  page: Puppeteer.Page,
+ *  request: Apify.Request,
+ *  searchString: string,
+ *  session: Apify.Session,
+ *  scrapingOptions: ScrapingOptions,
+ *  errorSnapshotter: ErrorSnapshotter,
+ *  stats: Stats,
+ *  maxCrawledPlacesTracker: MaxCrawledPlacesTracker,
+ *  crawler: Apify.PuppeteerCrawler,
+ * }} options
+ */
 module.exports.handlePlaceDetail = async (options) => {
     const {
-        page, request, searchString, session, scrapingOptions, errorSnapshotter, stats,
+        page, request, searchString, session, scrapingOptions, errorSnapshotter,
+        stats, maxCrawledPlacesTracker, crawler
     } = options;
     const {
         includeHistogram, includeOpeningHours, includePeopleAlsoSearch,
@@ -49,11 +54,7 @@ module.exports.handlePlaceDetail = async (options) => {
     }
 
     // Add info from listing page
-    // TODO: Address should be parsed from place JSON so it works on direct places
-    const { rank, searchPageUrl, addressParsed, isAdvertisement } = /** @type {PlaceUserData} */ (request.userData);
-
-    // Adding addressParsed there so it is nicely together in JSON
-    const pageData = await extractPageData({ page, addressParsed });
+    const { rank, searchPageUrl, isAdvertisement } = /** @type {PlaceUserData} */ (request.userData);
 
     // Extract gps from URL
     // We need to URL will be change, it happened asynchronously
@@ -68,17 +69,41 @@ module.exports.handlePlaceDetail = async (options) => {
 
     const coordinates = latMatch && lngMatch ? { lat: parseFloat(latMatch), lng: parseFloat(lngMatch) } : null;
 
+    // This huge JSON contains mostly everything, we still don't use it fully
+    // It seems to be stable over time
+    // Examples can be found in the /samples folder
     // NOTE: This is empty for certain types of direct URLs
     // Search and place IDs work fine
-    const reviewsJson = await page.evaluate(() => {
+    const jsonData = await page.evaluate(() => {
         try {
             // @ts-ignore
             return JSON.parse(APP_INITIALIZATION_STATE[3][6].replace(`)]}'`, ''))[6];
-        } catch (e) { }
+        } catch (e) {
+        }
     });
-    
-    let totalScore = reviewsJson && reviewsJson[4] ? reviewsJson[4][7] : null;
-    let reviewsCount = reviewsJson && reviewsJson[4] ? reviewsJson[4][8] : 0;
+
+    // Enable to debug data parsed from JSONs - DON'T FORGET TO REMOVE BEFORE PUSHING!
+    /*
+    await Apify.setValue('APP-OPTIONS', await page.evaluate(() => APP_OPTIONS ))
+    await Apify.setValue('APP_INIT_STATE', await page.evaluate(() => APP_INITIALIZATION_STATE ));
+    await Apify.setValue('JSON-DATA', jsonData);
+    */    
+
+    const pageData = await extractPageData({ page, jsonData });
+
+    const orderBy = (() => {
+        try {
+            return jsonData[75][0][0][2].map((/** @type {any} */ i) => {
+                return { name: i[0][0], url: i[1][2][0] }
+            });
+        } catch (e) {
+            return [];
+        }
+    })();
+
+    let totalScore = jsonData?.[4]?.[7] || null;
+    let reviewsCount = jsonData?.[4]?.[8] || 0;
+    let permanentlyClosed = (jsonData?.[203]?.[1]?.[4]?.[0] === 'Permanently closed');
 
     // We fallback to HTML (might be good to do only)
     if (!totalScore) {
@@ -92,7 +117,11 @@ module.exports.handlePlaceDetail = async (options) => {
             .replace(/[^0-9]+/g, '')) || 0);
     }
 
-    // TODO: Add a backup and figure out why some direct start URLs don't load reviewsJson
+    if (!permanentlyClosed) {
+        permanentlyClosed = await page.evaluate(() => $('#pane').text().includes('Permanently closed'));
+    }
+
+    // TODO: Add a backup and figure out why some direct start URLs don't load jsonData
     // direct place IDs are fine
     const reviewsDistributionDefault = {
         oneStar: 0,
@@ -104,46 +133,88 @@ module.exports.handlePlaceDetail = async (options) => {
 
     let reviewsDistribution = reviewsDistributionDefault;
 
-    if (reviewsJson) {
-        if (reviewsJson[52] && Array.isArray(reviewsJson[52][3])) {
-            const [oneStar, twoStar, threeStar, fourStar, fiveStar ] = reviewsJson[52][3];
+    if (jsonData) {
+        if (Array.isArray(jsonData?.[52]?.[3])) {
+            const [oneStar, twoStar, threeStar, fourStar, fiveStar] = jsonData[52][3];
             reviewsDistribution = { oneStar, twoStar, threeStar, fourStar, fiveStar };
         }
     }
 
-    const defaultReviewsJson = reviewsJson && reviewsJson[52] && reviewsJson[52][0];
-    
+    const defaultReviewsJson = jsonData?.[52]?.[0];
+
+    let cid;
+    const cidHexSplit = jsonData?.[10]?.split(':');
+    if (cidHexSplit && cidHexSplit[1]) {
+        // Hexadecimal to decimal. We have to use BigInt because JS Number does not have enough precision
+        cid = BigInt(cidHexSplit[1]).toString();
+    }    
+
+    // How many we should scrape (otherwise we retry)
+    const targetReviewsCount = Math.min(reviewsCount, maxReviews);
+
+    // extract categories
+    const categories = jsonData?.[13]
+
     const detail = {
         ...pageData,
+        permanentlyClosed,
         totalScore,
         isAdvertisement,
         rank,
-        placeId: request.uniqueKey,
+        placeId: jsonData?.[78] || request.uniqueKey,
+        categories: request.userData.categories || categories,
+        cid,
         url,
         searchPageUrl,
         searchString,
         location: coordinates, // keeping backwards compatible even though coordinates is better name
         scrapedAt: new Date().toISOString(),
-        ...includeHistogram ? await extractPopularTimes({ page }) : {},
+        ...includeHistogram ? extractPopularTimes({ jsonData }) : {},
         openingHours: includeOpeningHours ? await extractOpeningHours({ page }) : undefined,
         peopleAlsoSearch: includePeopleAlsoSearch ? await extractPeopleAlsoSearch({ page }) : undefined,
-        additionalInfo: additionalInfo ? await extractAdditionalInfo({ page }) : undefined,
+        additionalInfo: additionalInfo ? await extractAdditionalInfo({ page, placeUrl: url }) : undefined,
         reviewsCount,
         reviewsDistribution,
-        reviews: await errorSnapshotter.tryWithSnapshot(
-            page,
-            async () => extractReviews({ page, reviewsCount, maxReviews,
-                reviewsSort, reviewsTranslation, defaultReviewsJson, personalDataOptions: scrapingOptions.personalDataOptions }),
-            { name: 'Reviews extraction' },
-        ),
+        // IMPORTANT: The order of actions image -> reviews is important
+        // If you need to change it, you need to check the implementations
+        // and where the back buttons need to be 
+
+        // NOTE: Image URLs are quite rare for users to require
+        // In case the back button fails, we reload the page before reviews
         imageUrls: await errorSnapshotter.tryWithSnapshot(
             page,
-            async () => extractImages({ page, maxImages }),
+            async () => extractImages({ page, maxImages, targetReviewsCount, placeUrl: url }),
             { name: 'Image extraction' },
         ),
+        // NOTE: Reviews must be the last action on the detail page
+        // because the back button is always a little buggy (unless you fix it :) ).
+        // We want to close the page right after reviews are extracted
+        reviews: await errorSnapshotter.tryWithSnapshot(
+            page,
+            async () => extractReviews({
+                request,
+                page,
+                reviewsCount,
+                targetReviewsCount,
+                reviewsSort,
+                reviewsTranslation,
+                defaultReviewsJson,
+                personalDataOptions: scrapingOptions.personalDataOptions
+            }),
+            { name: 'Reviews extraction' },
+        ),
+        orderBy,
     };
 
+    
     await Apify.pushData(detail);
     stats.places();
     log.info(`[PLACE]: Place scraped successfully --- ${url}`);
+    const shouldScrapeMore = maxCrawledPlacesTracker.setScraped();
+    if (!shouldScrapeMore) {
+        log.warning(`[SEARCH]: Finishing scraping because we reached maxCrawledPlaces `
+            // + `currently: ${maxCrawledPlacesTracker.enqueuedPerSearch[searchKey]}(for this search)/${maxCrawledPlacesTracker.enqueuedTotal}(total) `
+            + `--- ${searchString} - ${request.url}`);
+        crawler.autoscaledPool?.abort();
+    }
 };

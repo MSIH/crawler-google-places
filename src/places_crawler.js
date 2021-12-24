@@ -2,8 +2,6 @@
 const Apify = require('apify');
 
 const typedefs = require('./typedefs'); // eslint-disable-line no-unused-vars
-const Stats = require('./stats'); // eslint-disable-line no-unused-vars
-const ErrorSnapshotter = require('./error-snapshotter'); // eslint-disable-line no-unused-vars
 
 const { enqueueAllPlaceDetails } = require('./enqueue_places');
 const { handlePlaceDetail } = require('./detail_page_handle');
@@ -16,17 +14,14 @@ const { injectJQuery, blockRequests } = Apify.utils.puppeteer;
 
 /**
  * @param {{
+ *  pageContext: any,
  *  scrapingOptions: typedefs.ScrapingOptions,
- *  crawlerOptions: typedefs.CrawlerOptions,
- *  stats: Stats,
- *  errorSnapshotter: ErrorSnapshotter,
- *  pageContext: Apify.PuppeteerHandlePageInputs,
+ *  helperClasses: typedefs.HelperClasses
  * }} options
  */
-const handlePageFunctionExtended = async ({ pageContext, scrapingOptions, crawlerOptions, stats, errorSnapshotter }) => {
-    const { request, page, puppeteerPool, session, autoscaledPool } = pageContext;
-    const { maxCrawledPlaces, multiplier } = scrapingOptions;
-    const { requestQueue } = crawlerOptions;
+const handlePageFunctionExtended = async ({ pageContext, scrapingOptions, helperClasses }) => {
+    const { request, page, session, crawler } = pageContext;
+    const { stats, errorSnapshotter, maxCrawledPlacesTracker } = helperClasses;
 
     const { label, searchString } = /** @type {{ label: string, searchString: string }} */ (request.userData);
 
@@ -42,6 +37,8 @@ const handlePageFunctionExtended = async ({ pageContext, scrapingOptions, crawle
         await waiter(() => request.userData.waitingForConsent === false);
     }
 
+    // Inject JQuery crashes on consent screen
+    // we need to first approve consent screen before injecting
     await injectJQuery(page);
 
     try {
@@ -50,16 +47,21 @@ const handlePageFunctionExtended = async ({ pageContext, scrapingOptions, crawle
             throw `[${logLabel}]: Got CAPTCHA on page, retrying --- ${searchString || ''} ${request.url}`;
         }
         if (label === 'startUrl') {
+            if (!maxCrawledPlacesTracker.canEnqueueMore(searchString || request.url)) {
+                // No need to log anything here as it was already logged for this search
+                return;
+            }
             log.info(`[${logLabel}]: Start enqueuing places details for search --- ${searchString || ''} ${request.url}`);
             await errorSnapshotter.tryWithSnapshot(
                 page,
                 async () => enqueueAllPlaceDetails({
                     page,
                     searchString,
-                    requestQueue,
+                    requestQueue: crawler.requestQueue,
                     request,
-                    stats,
+                    helperClasses,
                     scrapingOptions,
+                    crawler,
                 }),
             );
 
@@ -78,25 +80,13 @@ const handlePageFunctionExtended = async ({ pageContext, scrapingOptions, crawle
                 scrapingOptions,
                 errorSnapshotter,
                 stats,
+                maxCrawledPlacesTracker,
+                crawler,
             });
-
-            // TODO: Rework this terrible thing :)
-            // when using polygon search multiple start urls are used. Therefore more links are added to request queue,
-            // there is also good possibility that some of places will be out of desired polygon, so we do not check number of queued places,
-            // only number of places with correct geolocation
-            if (maxCrawledPlaces && maxCrawledPlaces !== 0) {
-                const dataset = await Apify.openDataset();
-                // @ts-ignore
-                const { cleanItemCount } = await dataset.getInfo();
-                if (cleanItemCount >= maxCrawledPlaces * multiplier) {
-                    await autoscaledPool.abort();
-                }
-            }
         }
         stats.ok();
     } catch (err) {
         session.retire();
-        await puppeteerPool.retire(page.browser());
         throw err;
     }
 };
@@ -106,19 +96,26 @@ const handlePageFunctionExtended = async ({ pageContext, scrapingOptions, crawle
  * @param {{
  *  crawlerOptions: typedefs.CrawlerOptions,
  *  scrapingOptions: typedefs.ScrapingOptions,
- *  stats: Stats,
- *  errorSnapshotter: ErrorSnapshotter,
+ *  helperClasses: typedefs.HelperClasses,
  * }} options
  */
-const setUpCrawler = ({ crawlerOptions, scrapingOptions, stats, errorSnapshotter }) => {
+module.exports.setUpCrawler = ({ crawlerOptions, scrapingOptions, helperClasses }) => {
     const { maxImages, language } = scrapingOptions;
     const { pageLoadTimeoutSec, ...options } = crawlerOptions;
+    const { stats, errorSnapshotter } = helperClasses;
     return new Apify.PuppeteerCrawler({
         // We have to strip this otherwise SDK complains
         ...options,
-        gotoFunction: async ({ request, page }) => {
+        preNavigationHooks: [async ({ request, page, session }, gotoOptions) => {
+            // TODO: Figure out how to drain the queue from only requests for search strings
+            // that reached maxCrawledPlacesPerSearch
+            // https://github.com/drobnikj/crawler-google-places/issues/171
+            /*
+                if (!maxCrawledPlacesTracker.canScrapeMore(request.userData.searchString)) {
+                    
+                }
+            */
             // @ts-ignore
-            // eslint-disable-next-line no-underscore-dangle
             await page._client.send('Emulation.clearDeviceMetricsOverride');
             // This blocks images so we have to skip it
             if (!maxImages) {
@@ -144,22 +141,20 @@ const setUpCrawler = ({ crawlerOptions, scrapingOptions, stats, errorSnapshotter
                     // @ts-ignore
                     request.userData.waitingForConsent = true;
                     await page.waitForTimeout(5000);
-                    await waitAndHandleConsentScreen(page, request.url);
+                    const { persistCookiesPerSession } = options;
+                    await waitAndHandleConsentScreen(page, request.url, persistCookiesPerSession, session);
                     // @ts-ignore
                     request.userData.waitingForConsent = false;
                     log.warning('Consent screen approved! We can continue scraping');
                 }
             });
 
-            // domcontent loaded should be fine, at least for place page
-            const result = await page.goto(request.url, { timeout: pageLoadTimeoutSec * 1000 });
-
-            return result;
-        },
+            gotoOptions.timeout = pageLoadTimeoutSec * 1000;
+        }],
         handlePageFunction: async (pageContext) => {
             await errorSnapshotter.tryWithSnapshot(
                 pageContext.page,
-                async () => handlePageFunctionExtended({ pageContext, scrapingOptions, crawlerOptions, stats, errorSnapshotter }),
+                async () => handlePageFunctionExtended({ pageContext, scrapingOptions, helperClasses }),
             );
         },
         handleFailedRequestFunction: async ({ request, error }) => {
@@ -181,5 +176,3 @@ const setUpCrawler = ({ crawlerOptions, scrapingOptions, stats, errorSnapshotter
         },
     });
 };
-
-module.exports = { setUpCrawler };

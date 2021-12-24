@@ -11,6 +11,13 @@ const { log } = Apify.utils;
 // If includeReviews/includeImages is not present, we process regularly
 /** @param {any} input */
 module.exports.makeInputBackwardsCompatible = (input) => {
+    // Deprecated on 2021-08
+    if (input.maxCrawledPlaces === 0) {
+        input.maxCrawledPlaces = 99999999;
+        log.warning('INPUT DEPRECATION: maxCrawledPlaces: 0 should no longer be used for infinite limit. '
+            + 'Use maxCrawledPlaces: 99999999 instead. Setting it to 99999999 for this run.');
+    }
+
     // Deprecated on 2020-07
     if (input.includeReviews !== undefined || input.includeImages !== undefined) {
         log.warning('INPUT DEPRECATION: includeReviews and includeImages '

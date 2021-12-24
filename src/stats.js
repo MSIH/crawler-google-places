@@ -4,7 +4,7 @@ const typedefs = require('./typedefs'); // eslint-disable-line no-unused-vars
 
 const { utils: { log } } = Apify;
 
-class Stats {
+module.exports = class Stats {
     constructor() {
         /** @type {typedefs.InnerStats} */
         this.stats = { failed: 0, ok: 0, outOfPolygon: 0, outOfPolygonCached: 0, places: 0, maps: 0 };
@@ -97,5 +97,3 @@ class Stats {
         }
     }
 }
-
-module.exports = Stats;

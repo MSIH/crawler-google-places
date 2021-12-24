@@ -6,7 +6,7 @@ const Puppeteer = require('puppeteer'); // eslint-disable-line
  * with a try/catch that saves a screenshot on the first occurence
  * of that error
  */
-class ErrorSnapshotter {
+module.exports = class ErrorSnapshotter {
     /**
      *
      * @param {object} [options]
@@ -107,5 +107,3 @@ class ErrorSnapshotter {
         }
     }
 }
-
-module.exports = ErrorSnapshotter;
